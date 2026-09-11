@@ -1,37 +1,43 @@
-﻿#include "cuda_runtime.h"
-#include "device_launch_parameters.h"
-#include <device_functions.h>
+﻿#include "cuda_runtime.h" // cudaMalloc, cudaMemcry, ядра
+#include "device_launch_parameters.h" // служебное Cuda
+#include <device_functions.h> // device-функции Cuda
 
 #include <iostream>
 #include <fstream>
-#include <cstring>
-#include <cstdint>
-#include <locale.h>
-#include <chrono>
+#include <cstring> // memset
+#include <cstdint> // uint8_t, uint64_t
+#include <locale.h> // setlocalle
+#include <chrono> // замер времени 
 
 using namespace std;
 
-constexpr int THREADS_PER_BLOCK = 256;
+constexpr int THREADS_PER_BLOCK = 256; // Кол-во потоков в одном ядре
 
-size_t codeLength = 1920;  // n
-size_t infoLength = 1280;  // k
+size_t codeLength = 1900; // n - длина кодового слова
+size_t infoLength = 1280; // k - сколько столбцов/шагов исключения
 
-constexpr int BITS = 64;
+constexpr int BITS = 64; // в одном uint64_t храним 64 бита 
 
+// Подсчет сколько раз по 64 бит нужно на строку (+ округляем до большего)
 inline size_t wordsPerRow(size_t n) {
 	return (n + BITS - 1) / BITS;
-}
+}//!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 __host__ __device__ inline int getBit(const uint64_t* row, int bit) {
+	//row - массив uint64_t одной строкой
+	//bit - номер бита
 	return (int)((row[bit / BITS] >> (bit % BITS)) & 1ULL);
-}
+}//!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 __host__ __device__ inline void setBit(uint64_t* row, int bit, int val) {
 	const uint64_t mask = 1ULL << (bit%BITS);
 	if (val) row[bit / BITS] |= mask;
 	else row[bit / BITS] &= ~mask;
-}
+}//!!!!!!!!!!!!!!!!!!!!!!!!!!
 
+
+// Макрос проверки CUDA
+//если есть ошибка, выводит текст, файл, номер строки и завершает программу
 #define CUDA_CHECK(call) \
     do { \
         cudaError_t err = call; \
@@ -42,37 +48,38 @@ __host__ __device__ inline void setBit(uint64_t* row, int bit, int val) {
         } \
     } while (0)
 
-
+// Поиск опорной строки 
 __global__ void findPivotKernel(
-	const uint64_t* L,
-	int col,
-	int wordsCount,
-	int wpr,
-	int* pivotRow)
+	const uint64_t* L, // вся матрица кодовых слов на ГПУ
+	int col, // текущий столбец
+	int wordsCount, //число строк М
+	int wpr, // слов uint64_t на одну строку
+	int* pivotRow) // указатель на int на ГПУ (сюда пишется номер строки)
 {
-	int row = blockIdx.x *blockDim.x + threadIdx.x;
-	if (row >= wordsCount) return;
+	int row = blockIdx.x *blockDim.x + threadIdx.x; // глобальный поток = номер строки 
+	if (row >= wordsCount) return; // лшние потоки( если м не делится на 256) выходят
 
-	const uint64_t* rowPtr = L + (size_t)row * wpr;
-	if (getBit(rowPtr, col)) {
-		atomicMin(pivotRow, row);
+	const uint64_t* rowPtr = L + (size_t)row * wpr; // указатель на начало строки rowв в плоском массиве L
+	if (getBit(rowPtr, col)) { // если в столбце col единица
+		atomicMin(pivotRow, row); // пытаемся записать как мин( проверяем с предыдущим мин
 	}
 }
 
+//xor хвоста с базисом base
 __device__ void xorTailFast(
-	uint64_t* row,
-	const uint64_t* base,
-	int col,
-	int n)   // n кратно 64, у тебя 1920
+	uint64_t* row, 
+	const uint64_t* base, // базисная строка( на которую умножаем)
+	int col, // с какогшо бита строки начинается хвост
+	int n) // длина
 {
 	int start = col + 1;
-	if (start >= n) return;
+	if (start >= n) return; // возвращаем если хвоста нет
 
-	int startWord = start / 64;
-	int startOff = start % 64;
-	int nWords = n / 64;   // 30 для n=1920
+	int startWord = start / 64; // с какого uint64_t начинаем
+	int startOff = start % 64; // смешение анутри слова
+	int nWords = n / 64; // сколько полных слов в длине n
 
-	// первое частичное слово
+	// если хвост начинается не с границы слова
 	if (startOff != 0) {
 		uint64_t mask = ~((1ULL << startOff) - 1ULL); // биты startOff..63
 		row[startWord] ^= base[startWord] & mask;
@@ -85,23 +92,28 @@ __device__ void xorTailFast(
 	}
 }
 
+// Обновление матрицы преобразования 
+// если G_tmp[row][col] == 1, XOR хвоста строки row с base
 __global__ void updateGTmpKernel(
-	uint64_t* G_tmp,
-	const uint64_t* base,
-	int col,
-	int n,
-	int wpr)
+	uint64_t* G_tmp, // накопленная матрица на ГПУ
+	const uint64_t* base, // опорная трока (копия)
+	int col, // текущий шаг
+	int n, // размер 
+	int wpr) // слов на строку(по 64)
 {
-	int row = blockIdx.x * blockDim.x + threadIdx.x;
+	int row = blockIdx.x * blockDim.x + threadIdx.x; // одна строка G_tmp на поток
 	if (row >= n) return;
 
-	uint64_t* rowPtr = G_tmp + (size_t)row * wpr;
-	if (!getBit(rowPtr, col)) return;
+	uint64_t* rowPtr = G_tmp + (size_t)row * wpr; 
+	if (!getBit(rowPtr, col)) return; // не меняем строку
 
 	xorTailFast(rowPtr, base, col, n);
-	// или xorTailPacked(rowPtr, base, col, n, wpr);
+	//!!!!!!!!!!!!!!!!!!!!!!!!!!
 }
 
+// Исключение столбца L
+// та же идея xor, но для всех кодовых слов
+// если L[row][col] == 1, XOR хвоста L[row] с base
 __global__ void eliminateColumnKernel(
 	uint64_t* L,
 	const uint64_t* base,
@@ -119,35 +131,37 @@ __global__ void eliminateColumnKernel(
 	xorTailFast(rowPtr, base, col, n);
 }
 
+// Создает матрицу на ЦПУ I, размера n х n
 uint64_t* createIdentityPacked(size_t n) {
 	size_t wpr = wordsPerRow(n);
-	uint64_t* mat = new uint64_t[n * wpr];
-	memset(mat, 0, n * wpr * sizeof(uint64_t));
+	uint64_t* mat = new uint64_t[n * wpr]; // выделяем слова
+	memset(mat, 0, n * wpr * sizeof(uint64_t)); // обнуляем матрицу
 	for (size_t i = 0; i < n; i++) {
-		setBit(mat + i * wpr, (int)i, 1);
+		setBit(mat + i * wpr, (int)i, 1); // ставим mat[i][i] = 1
 	}
 	return mat;
 }
 
+// Чтение файла
 bool ReadCodeWords(
-	const string& filename, 
-	size_t codeLength, 
-	uint64_t*& L, 
-	size_t& wordsCount,
+	const string& filename, // путь к файлу
+	size_t codeLength, // n
+	uint64_t*& L, // ссылка на указатель( ф-ция сама выделит массив и вернет через L)
+	size_t& wordsCount, // М
 	bool isBis) 
 {
-	ifstream file(filename, ios::binary);
+	ifstream file(filename, ios::binary); // Открываем файл
 	if (!file.is_open()) {
 		cout << "Не удалось открыть файл" << endl;
 		return false;
 	}
 
 	file.seekg(0, ios::end);
-	size_t fileSizeBytes = (size_t)file.tellg();
+	size_t fileSizeBytes = (size_t)file.tellg(); // узнаем разме файла в байтах
 	file.seekg(0, ios::beg);
 
-	size_t totalBits = isBis ? fileSizeBytes : fileSizeBytes * 8;
-	wordsCount = totalBits / codeLength;
+	size_t totalBits = isBis ? fileSizeBytes : fileSizeBytes * 8;// узнаем сколько бит нам нужно
+	wordsCount = totalBits / codeLength; // сколько кодовых слов
 
 	if (wordsCount == 0) {
 		cout << "Недостаточно данных в файле" << endl;
@@ -158,14 +172,14 @@ bool ReadCodeWords(
 	//cout << "Кодовых слов: " << wordsCount << ", n = " << codeLength << endl;
 
 	uint8_t* buffer = new uint8_t[fileSizeBytes];
-	file.read(reinterpret_cast<char*>(buffer), fileSizeBytes);
+	file.read(reinterpret_cast<char*>(buffer), fileSizeBytes); // читаем весь файл в буффер
 	file.close();
 
 	const size_t wpr = wordsPerRow(codeLength);
-	L = new uint64_t[wordsCount * wpr];
-	memset(L, 0, wordsCount * wpr * sizeof(uint64_t));
+	L = new uint64_t[wordsCount * wpr]; // выделяем L на wordsCount * wpr слов
+	memset(L, 0, wordsCount * wpr * sizeof(uint64_t)); // и обнуляем
 
-	if (isBis) {
+	if (isBis) { // если формат Bis
 		size_t pos = 0;
 		for (size_t w = 0; w < wordsCount; w++) {
 			uint64_t* row = L + w * wpr;
@@ -176,7 +190,7 @@ bool ReadCodeWords(
 			}
 		}
 	}
-	else {
+	else { // если формат Bin
 		size_t bitPos = 0;
 		for (size_t w = 0; w < wordsCount; w++) {
 			uint64_t* row = L + w * wpr;
@@ -194,7 +208,8 @@ bool ReadCodeWords(
 	return true;
 }
 
-void WriteResultPackedToBin(
+// Запись результата в файл 
+void WriteResultPacked(
 	const string& path, 
 	const uint64_t* G, 
 	size_t n, 
@@ -240,43 +255,40 @@ void WriteResultPackedToBin(
 }
 
 // Основной алгоритм
-void mainFunction(
-	size_t wordsCount,
-	size_t codeLength,
-	size_t infoLength,
-	uint64_t* d_L,
-	uint64_t* d_G_tmp,
-	int* d_pivot,
-	uint64_t* d_base,
-	int wpr)
+void runIterativeEliminationGPU(
+	size_t wordsCount, // М
+	size_t codeLength, // n
+	size_t infoLength, // k
+	uint64_t* d_L, // кодовые слова
+	uint64_t* d_G_tmp, // накопленные преобразования
+	int* d_pivot, // ячейка под номером pivot
+	uint64_t* d_base, // буфер под копию опорной строки
+	int wpr) // слов (по 64) на строку
 {
-	int blocks = (int)((wordsCount + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
-	int gBlocks = (int)((codeLength + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+	int blocks = (int)((wordsCount + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK); // сколько блоков, чтобы покрыть М строк
+	int gBlocks = (int)((codeLength + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK); // сколько блоков, чтобы покрыть n строк G_tmp
 
 	for (int col = 0; col < (int)infoLength; col++) {
-		int h_pivot = (int)wordsCount;
-		CUDA_CHECK(cudaMemcpy(d_pivot, &h_pivot, sizeof(int), cudaMemcpyHostToDevice));
+		int h_pivot = (int)wordsCount; // маркер: не найдено
+		CUDA_CHECK(cudaMemcpy(d_pivot, &h_pivot, sizeof(int), cudaMemcpyHostToDevice)); // делаем копию
 
-		findPivotKernel << <blocks, THREADS_PER_BLOCK >> > (
+		findPivotKernel << <blocks, THREADS_PER_BLOCK >> > ( // поиск лид.ед-цы
 			d_L, col, (int)wordsCount, wpr, d_pivot);
-		CUDA_CHECK(cudaDeviceSynchronize());
+		CUDA_CHECK(cudaDeviceSynchronize()); // ждем ГПУ
 
-		CUDA_CHECK(cudaMemcpy(&h_pivot, d_pivot, sizeof(int), cudaMemcpyDeviceToHost));
-		if (h_pivot >= (int)wordsCount) continue;
+		CUDA_CHECK(cudaMemcpy(&h_pivot, d_pivot, sizeof(int), cudaMemcpyDeviceToHost)); // копируем на ЦПУ
+		if (h_pivot >= (int)wordsCount) continue; //если столбца нет, продолжаем
 
-		CUDA_CHECK(cudaMemcpy(
-			d_base,
-			d_L + (size_t)h_pivot * wpr,
-			(size_t)wpr * sizeof(uint64_t),
-			cudaMemcpyDeviceToDevice));
-
-		updateGTmpKernel << <gBlocks, THREADS_PER_BLOCK >> > (
+		CUDA_CHECK(cudaMemcpy(d_base, d_L + (size_t)h_pivot * wpr, (size_t)wpr * sizeof(uint64_t),
+			cudaMemcpyDeviceToDevice)); // копия строки d_L[h_pivot] -> d_base (чтобы base не портился при exclude)
+		 
+		updateGTmpKernel << <gBlocks, THREADS_PER_BLOCK >> > (// обновляем G_tmp
 			d_G_tmp, d_base, col, (int)codeLength, wpr);
 
-		eliminateColumnKernel << <blocks, THREADS_PER_BLOCK >> > (
+		eliminateColumnKernel << <blocks, THREADS_PER_BLOCK >> > ( // обновляем L
 			d_L, d_base, col, (int)wordsCount, (int)codeLength, wpr);
 
-		CUDA_CHECK(cudaDeviceSynchronize());
+		CUDA_CHECK(cudaDeviceSynchronize()); // ждем гпу
 	}
 }
 
@@ -285,9 +297,9 @@ int main() {
 
 	auto start = chrono::high_resolution_clock::now();
 
-	string InputFileName = R"(D:\Rubin\sessions\tmp_1783328386069\files\8.27.bis)";
-	string OutputFileName = R"(D:\Rubin\sessions\tmp_1783328386069\files\output.bis)";
-	bool isBis = true;
+	string InputFileName = R"(D:\Rubin\sessions\tmp_1783328386069\files\8800.bin)";
+	string OutputFileName = R"(D:\Rubin\sessions\tmp_1783328386069\files\output.bin)";
+	bool isBis = false;
 
 	uint64_t* h_L = nullptr;
 	uint64_t* d_L = nullptr;
@@ -307,14 +319,15 @@ int main() {
 	size_t G_bytes = codeLength * wpr * sizeof(uint64_t);
 	uint64_t* G_tmp = createIdentityPacked(codeLength);
 
+	// Память ГПУ
 	CUDA_CHECK(cudaMalloc(&d_L, L_bytes));
-	CUDA_CHECK(cudaMalloc(&d_G_tmp, G_bytes));
 	CUDA_CHECK(cudaMemcpy(d_L, h_L, L_bytes, cudaMemcpyHostToDevice));
+	CUDA_CHECK(cudaMalloc(&d_G_tmp, G_bytes));
+	CUDA_CHECK(cudaMemcpy(d_G_tmp, G_tmp, G_bytes, cudaMemcpyHostToDevice));
 	CUDA_CHECK(cudaMalloc(&d_base, wpr * sizeof(uint64_t)));
 	CUDA_CHECK(cudaMalloc(&d_pivot, sizeof(int)));
-	CUDA_CHECK(cudaMemcpy(d_G_tmp, G_tmp, G_bytes, cudaMemcpyHostToDevice));
 
-	mainFunction(
+	runIterativeEliminationGPU(
 		wordsCount,
 		codeLength,
 		infoLength,
@@ -326,7 +339,7 @@ int main() {
 	);
 
 	CUDA_CHECK(cudaMemcpy(G_tmp, d_G_tmp, G_bytes, cudaMemcpyDeviceToHost));
-	WriteResultPackedToBin(OutputFileName, G_tmp, codeLength, wpr, isBis);
+	WriteResultPacked(OutputFileName, G_tmp, codeLength, wpr, isBis);
 
 	// Освобождение
 	CUDA_CHECK(cudaFree(d_L));
