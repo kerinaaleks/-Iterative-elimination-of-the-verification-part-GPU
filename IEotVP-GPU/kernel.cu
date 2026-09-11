@@ -13,7 +13,7 @@ using namespace std;
 
 constexpr int THREADS_PER_BLOCK = 256;
 
-size_t codeLength = 1900;  // n
+size_t codeLength = 1920;  // n
 size_t infoLength = 1280;  // k
 
 constexpr int BITS = 64;
@@ -129,7 +129,13 @@ uint64_t* createIdentityPacked(size_t n) {
 	return mat;
 }
 
-bool ReadCodeWords(const string& filename, size_t codeLength, uint64_t*& L, size_t& wordsCount) {
+bool ReadCodeWords(
+	const string& filename, 
+	size_t codeLength, 
+	uint64_t*& L, 
+	size_t& wordsCount,
+	bool isBis) 
+{
 	ifstream file(filename, ios::binary);
 	if (!file.is_open()) {
 		cout << "Не удалось открыть файл" << endl;
@@ -140,15 +146,16 @@ bool ReadCodeWords(const string& filename, size_t codeLength, uint64_t*& L, size
 	size_t fileSizeBytes = (size_t)file.tellg();
 	file.seekg(0, ios::beg);
 
-	size_t totalBits = fileSizeBytes * 8;
+	size_t totalBits = isBis ? fileSizeBytes : fileSizeBytes * 8;
 	wordsCount = totalBits / codeLength;
+
 	if (wordsCount == 0) {
 		cout << "Недостаточно данных в файле" << endl;
 		file.close();
 		return false;
 	}
 
-	cout << "Кодовых слов: " << wordsCount << ", n = " << codeLength << endl;
+	//cout << "Кодовых слов: " << wordsCount << ", n = " << codeLength << endl;
 
 	uint8_t* buffer = new uint8_t[fileSizeBytes];
 	file.read(reinterpret_cast<char*>(buffer), fileSizeBytes);
@@ -158,15 +165,28 @@ bool ReadCodeWords(const string& filename, size_t codeLength, uint64_t*& L, size
 	L = new uint64_t[wordsCount * wpr];
 	memset(L, 0, wordsCount * wpr * sizeof(uint64_t));
 
-	size_t bitPos = 0;
-	for (size_t w = 0; w < wordsCount; w++) {
-		uint64_t* row = L + w * wpr;
-		for (size_t b = 0; b < codeLength; b++) {
-			size_t byteIndex = bitPos / 8;
-			size_t bitIndex = bitPos % 8;
-			int bit = (buffer[byteIndex] >> bitIndex) & 1;
-			if (bit) setBit(row, (int)b, 1);
-			bitPos++;
+	if (isBis) {
+		size_t pos = 0;
+		for (size_t w = 0; w < wordsCount; w++) {
+			uint64_t* row = L + w * wpr;
+			for (size_t b = 0; b < codeLength; b++) {
+				if (buffer[pos] != 0)
+					setBit(row, (int)b, 1);
+				pos++;
+			}
+		}
+	}
+	else {
+		size_t bitPos = 0;
+		for (size_t w = 0; w < wordsCount; w++) {
+			uint64_t* row = L + w * wpr;
+			for (size_t b = 0; b < codeLength; b++) {
+				size_t byteIndex = bitPos / 8;
+				size_t bitIndex = bitPos % 8;
+				int bit = (buffer[byteIndex] >> bitIndex) & 1;
+				if (bit) setBit(row, (int)b, 1);
+				bitPos++;
+			}
 		}
 	}
 
@@ -174,23 +194,49 @@ bool ReadCodeWords(const string& filename, size_t codeLength, uint64_t*& L, size
 	return true;
 }
 
-void WriteResultPackedToBin(const string& path, const uint64_t* G, size_t n, size_t wpr) {
-	size_t totalBits = n * n;
-	size_t totalBytes = (totalBits + 7) / 8;
-	uint8_t* buf = new uint8_t[totalBytes]();
-
-	size_t outBit = 0;
-	for (size_t i = 0; i < n; i++) {
-		const uint64_t* row = G + i * wpr;
-		for (size_t j = 0; j < n; j++) {
-			if (getBit(row, (int)j))
-				buf[outBit / 8] |= (uint8_t)(1u << (outBit % 8));
-			outBit++;
-		}
-	}
+void WriteResultPackedToBin(
+	const string& path, 
+	const uint64_t* G, 
+	size_t n, 
+	size_t wpr,
+	bool isBis) 
+{
 	ofstream out(path, ios::binary);
-	out.write(reinterpret_cast<char*>(buf), totalBytes);
-	delete[] buf;
+	if (!out.is_open()) {
+		cerr << "Не удалось открыть файл для записи" << endl;
+		return;
+	}
+
+	if (isBis) {
+		size_t totalBytes = n * n;
+		uint8_t* buf = new uint8_t[totalBytes];
+		size_t pos = 0;
+		for (size_t i = 0; i < n; i++){
+			const uint64_t* row = G + i * wpr;
+			for (size_t j = 0; j < n; j++) {
+				buf[pos++] = getBit(row, (int)j) ? 0xFF : 0x00;
+			}
+		}
+		out.write(reinterpret_cast<char*>(buf), totalBytes);
+		delete[] buf;
+	}
+	else {
+		size_t totalBits = n * n;
+		size_t totalBytes = (totalBits + 7) / 8;
+		uint8_t* buf = new uint8_t[totalBytes]();
+
+		size_t outBit = 0;
+		for (size_t i = 0; i < n; i++) {
+			const uint64_t* row = G + i * wpr;
+			for (size_t j = 0; j < n; j++) {
+				if (getBit(row, (int)j))
+					buf[outBit / 8] |= (uint8_t)(1u << (outBit % 8));
+				outBit++;
+			}
+		}
+		out.write(reinterpret_cast<char*>(buf), totalBytes);
+		delete[] buf;
+	}
 }
 
 // Основной алгоритм
@@ -239,9 +285,9 @@ int main() {
 
 	auto start = chrono::high_resolution_clock::now();
 
-	string InputFileName = R"(D:\Rubin\sessions\tmp_1783328386069\files\4.4.bin)";
-	string OutputFileName = R"(D:\Rubin\sessions\tmp_1783328386069\files\output.bin)";
-	bool isBis = false;
+	string InputFileName = R"(D:\Rubin\sessions\tmp_1783328386069\files\8.27.bis)";
+	string OutputFileName = R"(D:\Rubin\sessions\tmp_1783328386069\files\output.bis)";
+	bool isBis = true;
 
 	uint64_t* h_L = nullptr;
 	uint64_t* d_L = nullptr;
@@ -250,7 +296,7 @@ int main() {
 	int* d_pivot = nullptr;
 
 	size_t wordsCount = 0;
-	if (!ReadCodeWords(InputFileName, codeLength, h_L, wordsCount)) {
+	if (!ReadCodeWords(InputFileName, codeLength, h_L, wordsCount, isBis)) {
 		return 1;
 	}
 
@@ -280,7 +326,7 @@ int main() {
 	);
 
 	CUDA_CHECK(cudaMemcpy(G_tmp, d_G_tmp, G_bytes, cudaMemcpyDeviceToHost));
-	WriteResultPackedToBin(OutputFileName, G_tmp, codeLength, wpr);
+	WriteResultPackedToBin(OutputFileName, G_tmp, codeLength, wpr, isBis);
 
 	// Освобождение
 	CUDA_CHECK(cudaFree(d_L));
