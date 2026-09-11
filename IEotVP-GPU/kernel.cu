@@ -1,16 +1,37 @@
 ﻿#include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 #include <device_functions.h>
+
 #include <iostream>
-#include <cstring>      // для memset и memcpy
-#include <cstdint>
-#include <iomanip>
 #include <fstream>
+#include <cstring>
+#include <cstdint>
+#include <algorithm>
+#include <locale.h>
+#include <chrono>
 
 using namespace std;
 
-size_t codeLength = 2004; // длина кодового слова n
-size_t infoLength = 2000; // число шагов (k)
+constexpr int THREADS_PER_BLOCK = 256;
+
+size_t codeLength = 1920;  // n
+size_t infoLength = 1280;  // k
+
+constexpr int BITS = 64;
+
+inline size_t wordsPerRow(size_t n) {
+	return (n + BITS - 1) / BITS;
+}
+
+__host__ __device__ inline int getBit(const uint64_t* row, int bit) {
+	return (int)((row[bit / BITS] >> (bit % BITS)) & 1ULL);
+}
+
+__host__ __device__ inline void setBit(uint64_t* row, int bit, int val) {
+	const uint64_t mask = 1ULL << (bit%BITS);
+	if (val) row[bit / BITS] |= mask;
+	else row[bit / BITS] &= ~mask;
+}
 
 #define CUDA_CHECK(call) \
     do { \
@@ -22,111 +43,108 @@ size_t infoLength = 2000; // число шагов (k)
         } \
     } while (0)
 
-__global__ void eliminateColumnKernel(
-	uint8_t* L,
-	const uint8_t* base,
+
+__global__ void findPivotKernel(
+	const uint64_t* L,
 	int col,
 	int wordsCount,
-	int codeLength)
+	int wpr,
+	int* pivotRow)
+{
+	int row = blockIdx.x *blockDim.x + threadIdx.x;
+	if (row >= wordsCount) return;
+
+	const uint64_t* rowPtr = L + (size_t)row * wpr;
+	if (getBit(rowPtr, col)) {
+		atomicMin(pivotRow, row);
+	}
+}
+
+__device__ void xorTailFast(
+	uint64_t* row,
+	const uint64_t* base,
+	int col,
+	int n)   // n кратно 64, у тебя 1920
+{
+	int start = col + 1;
+	if (start >= n) return;
+
+	int startWord = start / 64;
+	int startOff = start % 64;
+	int nWords = n / 64;   // 30 для n=1920
+
+	// первое частичное слово
+	if (startOff != 0) {
+		uint64_t mask = ~((1ULL << startOff) - 1ULL); // биты startOff..63
+		row[startWord] ^= base[startWord] & mask;
+		startWord++;
+	}
+
+	// полные слова до конца
+	for (int w = startWord; w < nWords; w++) {
+		row[w] ^= base[w];
+	}
+}
+
+__device__ void xorTailSimple(
+	uint64_t* row,
+	const uint64_t* base,
+	int col,
+	int n)
+{
+	for (int j = col + 1; j < n; j++) {
+		if (getBit(base, j)) {
+			// toggle bit j in row
+			row[j / BITS] ^= (1ULL << (j % BITS));
+		}
+	}
+}
+
+__global__ void updateGTmpKernel(
+	uint64_t* G_tmp,
+	const uint64_t* base,
+	int col,
+	int n,
+	int wpr)
+{
+	int row = blockIdx.x * blockDim.x + threadIdx.x;
+	if (row >= n) return;
+
+	uint64_t* rowPtr = G_tmp + (size_t)row * wpr;
+	if (!getBit(rowPtr, col)) return;
+
+	xorTailFast(rowPtr, base, col, n);
+	// или xorTailPacked(rowPtr, base, col, n, wpr);
+}
+
+__global__ void eliminateColumnKernel(
+	uint64_t* L,
+	const uint64_t* base,
+	int col,
+	int wordsCount,
+	int n,
+	int wpr)
 {
 	int row = blockIdx.x * blockDim.x + threadIdx.x;
 	if (row >= wordsCount) return;
 
-	uint8_t* rowPtr = L + row * codeLength; 
-	// Если в опорном столбце стоит 1 - делаем XOR хвоста
-	if (rowPtr[col] == 1){
-		for (int j = col + 1; j < codeLength; j++) {
-			rowPtr[j] ^= base[j];
-		}
-	}
+	uint64_t* rowPtr = L + (size_t)row * wpr;
+	if (!getBit(rowPtr, col)) return;
+
+	xorTailFast(rowPtr, base, col, n);
 }
 
-__global__ void matMulKernel(
-	const uint8_t* G_tmp,
-	const uint8_t* G,
-	uint8_t* G_res,
-	int n)
-{
-	int row = blockIdx.y * blockDim.y + threadIdx.y;
-	int col = blockIdx.x * blockDim.x + threadIdx.x;
-
-	if (row >= n || col >= n) return;
-
-	uint8_t sum = 0;
-	for (int k = 0; k < n; k++) {
-		sum ^= (G_tmp[row * n + k] & G[k * n + col]);
-	}
-	G_res[row * n + col] = sum;
-}
-
-void matrixToFlat(uint8_t** src, uint8_t* dst, size_t n) {
+uint64_t* createIdentityPacked(size_t n) {
+	size_t wpr = wordsPerRow(n);
+	uint64_t* mat = new uint64_t[n * wpr];
+	memset(mat, 0, n * wpr * sizeof(uint64_t));
 	for (size_t i = 0; i < n; i++) {
-		memcpy(dst + i * n, src[i], n);
-	}
-}
-
-void flatToMatrix(uint8_t* src, uint8_t** dst, size_t n) {
-	for (int i = 0; i < n; i++) {
-		memcpy(dst[i], src + i * n, n);
-	}
-}
-
-__device__ __forceinline__ bool GetBitDevice(const uint8_t* row, int bitIndex) {
-	return (row[bitIndex / 8] >> (bitIndex % 8)) & 1;
-}
-
-inline bool GetBitHost(const uint8_t* row, size_t bitIndex) {
-	return (row[bitIndex / 8] >> (bitIndex % 8)) & 1;
-}
-
-// Вывод матрицы
-void printMatrix(const char* name, uint8_t** mat, size_t rows, size_t cols) {
-	cout << name << "(" << rows << "x" << cols << "):" << endl;
-
-	for (size_t i = 0; i < rows; i++) {
-		for (size_t j = 0; j < cols; j++) {
-			cout << (int)mat[i][j] << " ";
-		}
-		cout << endl;
-	}
-	cout << endl;
-}
-
-void freeMatrix(uint8_t** mat, size_t rows) {
-	if (!mat) return;
-	for (size_t i = 0; i < rows; i++) {
-		delete[] mat[i];
-	}
-	delete[] mat;
-}
-
-uint8_t** createIdentityMatrix(size_t n) {
-	uint8_t** mat = new uint8_t*[n];
-	for (size_t i = 0; i < n; i++) {
-		mat[i] = new uint8_t[n];
-		memset(mat[i], 0, n);
-		mat[i][i] = 1;
+		setBit(mat + i * wpr, (int)i, 1);
 	}
 	return mat;
 }
 
-uint8_t** createZeroMatrix(size_t rows, size_t cols) {
-	uint8_t** mat = new uint8_t*[rows];
-	for (size_t i = 0; i < rows; i++) {
-		mat[i] = new uint8_t[cols];
-		memset(mat[i], 0, cols);
-	}
-	return mat;
-}
-
-void copyMatrix(uint8_t** dst, uint8_t** src, size_t rows, size_t cols) {
-	for (size_t i = 0; i < rows; i++) {
-		memcpy(dst[i], src[i], cols);
-	}
-}
-
-// Чтение файла и преобразование в плоску матрицу
-bool ReadCodeWords(const string& filename, size_t codeLength, uint8_t*& L, size_t& wordsCount) {
+bool ReadCodeWords(const string& filename, size_t codeLength, uint64_t*& L, size_t& wordsCount) {
 	ifstream file(filename, ios::binary);
 	if (!file.is_open()) {
 		cout << "Не удалось открыть файл" << endl;
@@ -134,249 +152,164 @@ bool ReadCodeWords(const string& filename, size_t codeLength, uint8_t*& L, size_
 	}
 
 	file.seekg(0, ios::end);
-	size_t fileSizeBytes = file.tellg();
+	size_t fileSizeBytes = (size_t)file.tellg();
 	file.seekg(0, ios::beg);
 
 	size_t totalBits = fileSizeBytes * 8;
 	wordsCount = totalBits / codeLength;
-
-	//
 	if (wordsCount == 0) {
 		cout << "Недостаточно данных в файле" << endl;
 		file.close();
 		return false;
 	}
 
+	cout << "Кодовых слов: " << wordsCount << ", n = " << codeLength << endl;
+
 	uint8_t* buffer = new uint8_t[fileSizeBytes];
 	file.read(reinterpret_cast<char*>(buffer), fileSizeBytes);
 	file.close();
 
-	//
-	uint8_t* L_flat = new uint8_t[wordsCount * codeLength];
-	memset(L_flat, 0, wordsCount * codeLength);
+	const size_t wpr = wordsPerRow(codeLength);
+	L = new uint64_t[wordsCount * wpr];
+	memset(L, 0, wordsCount * wpr * sizeof(uint64_t));
 
-	//
 	size_t bitPos = 0;
 	for (size_t w = 0; w < wordsCount; w++) {
+		uint64_t* row = L + w * wpr;
 		for (size_t b = 0; b < codeLength; b++) {
 			size_t byteIndex = bitPos / 8;
 			size_t bitIndex = bitPos % 8;
-
-			L_flat[w * codeLength +b] = (buffer[byteIndex] >> bitIndex) & 1;
+			int bit = (buffer[byteIndex] >> bitIndex) & 1;
+			if (bit) setBit(row, (int)b, 1);
 			bitPos++;
 		}
 	}
+
 	delete[] buffer;
-	L = L_flat;
 	return true;
 }
 
-void WriteResultToFile(
-	const string& fileName,
-	uint8_t** G_tmp,
-	size_t n,
-	bool isBis) 
-{
-	ofstream out(fileName, ios::binary);
-	if (!out.is_open()) {
-		cerr << "Не удалось открыть файл для записи\n";
-		return;
-	}
+void WriteResultPackedToBin(const string& path, const uint64_t* G, size_t n, size_t wpr) {
+	size_t totalBits = n * n;
+	size_t totalBytes = (totalBits + 7) / 8;
+	uint8_t* buf = new uint8_t[totalBytes]();
 
-	if (isBis) {
-		size_t totalBytes = n * n;
-		uint8_t* buf = new uint8_t[totalBytes];
-		size_t pos = 0;
-		for (size_t i = 0; i < n; ++i) {
-			for (size_t j = 0; j < n; ++j) {
-				buf[pos++] = G_tmp[i][j] ? 0xFF : 0x00;
-			}
+	size_t outBit = 0;
+	for (size_t i = 0; i < n; i++) {
+		const uint64_t* row = G + i * wpr;
+		for (size_t j = 0; j < n; j++) {
+			if (getBit(row, (int)j))
+				buf[outBit / 8] |= (uint8_t)(1u << (outBit % 8));
+			outBit++;
 		}
-		out.write(reinterpret_cast<char*>(buf), totalBytes);
-		delete[] buf;
 	}
-	else {
-		size_t totalBits = n * n;
-		size_t totalBytes = (totalBits + 7) / 8;
-		uint8_t* buf = new uint8_t[totalBytes]();
-		size_t bitPos = 0;
-		for (size_t i = 0; i < n; i++) {
-			for (size_t j = 0; j < n; j++) {
-				if (G_tmp[i][j]) {
-					buf[bitPos / 8] |= (1u << (bitPos % 8));
-				}
-				bitPos++;
-			}
-		}
-		out.write(reinterpret_cast<char*>(buf), totalBytes);
-		delete[] buf;
+	ofstream out(path, ios::binary);
+	out.write(reinterpret_cast<char*>(buf), totalBytes);
+	delete[] buf;
+}
+
+// Основной алгоритм
+void mainFunction(
+	size_t wordsCount,
+	size_t codeLength,
+	size_t infoLength,
+	uint64_t* d_L,
+	uint64_t* d_G_tmp,
+	int* d_pivot,
+	uint64_t* d_base,
+	int wpr)
+{
+	int blocks = (int)((wordsCount + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+	int gBlocks = (int)((codeLength + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+
+	for (int col = 0; col < (int)infoLength; col++) {
+		int h_pivot = (int)wordsCount;
+		CUDA_CHECK(cudaMemcpy(d_pivot, &h_pivot, sizeof(int), cudaMemcpyHostToDevice));
+
+		findPivotKernel << <blocks, THREADS_PER_BLOCK >> > (
+			d_L, col, (int)wordsCount, wpr, d_pivot);
+		CUDA_CHECK(cudaDeviceSynchronize());
+
+		CUDA_CHECK(cudaMemcpy(&h_pivot, d_pivot, sizeof(int), cudaMemcpyDeviceToHost));
+		if (h_pivot >= (int)wordsCount) continue;
+
+		CUDA_CHECK(cudaMemcpy(
+			d_base,
+			d_L + (size_t)h_pivot * wpr,
+			(size_t)wpr * sizeof(uint64_t),
+			cudaMemcpyDeviceToDevice));
+
+		updateGTmpKernel << <gBlocks, THREADS_PER_BLOCK >> > (
+			d_G_tmp, d_base, col, (int)codeLength, wpr);
+
+		eliminateColumnKernel << <blocks, THREADS_PER_BLOCK >> > (
+			d_L, d_base, col, (int)wordsCount, (int)codeLength, wpr);
+
+		CUDA_CHECK(cudaDeviceSynchronize());
 	}
-	out.close();
 }
 
 int main() {
+	setlocale(LC_ALL, "");
 
-	string InputFileName = R"(D:\Rubin\sessions\tmp_1783328386069\files\4.4.bin)";
+	auto start = chrono::high_resolution_clock::now();
+
+	string InputFileName = R"(D:\Rubin\sessions\tmp_1783328386069\files\7.16.bin)";
 	string OutputFileName = R"(D:\Rubin\sessions\tmp_1783328386069\files\output.bin)";
 	bool isBis = false;
 
-	uint8_t* h_L = nullptr; // плоская Матрица кодовых слов на хосте
-	size_t wordsCount = 0;
+	uint64_t* h_L = nullptr;
+	uint64_t* d_L = nullptr;
+	uint64_t* d_G_tmp = nullptr;
+	uint64_t* d_base = nullptr;
+	int* d_pivot = nullptr;
 
+	size_t wordsCount = 0;
 	if (!ReadCodeWords(InputFileName, codeLength, h_L, wordsCount)) {
 		return 1;
 	}
 
+	size_t wpr = wordsPerRow(codeLength);
+	size_t L_words = wordsCount * wpr;
+	size_t G_words = codeLength * wpr;
 
-	uint8_t* h_G_tmp = new uint8_t[codeLength * codeLength];
-	uint8_t* h_G = new uint8_t[codeLength * codeLength];
-	uint8_t* h_G_res = new uint8_t[codeLength * codeLength];
-
-	uint8_t* d_G_tmp = nullptr;
-	uint8_t* d_G = nullptr;
-	uint8_t* d_G_res = nullptr;
-
-	size_t G_bytes = codeLength * codeLength * sizeof(uint8_t);
-
-	CUDA_CHECK(cudaMalloc(&d_G_tmp, G_bytes));
-	CUDA_CHECK(cudaMalloc(&d_G, G_bytes));
-	CUDA_CHECK(cudaMalloc(&d_G_res, G_bytes));
-
-
-
-
-	uint8_t** G_tmp = createIdentityMatrix(codeLength); // Накопленная матрица преобразований (результат работы алгоритма)
-	uint8_t** G = createZeroMatrix(codeLength, codeLength); // Текущая матрица преобразования на одном шаге
-	uint8_t** G_res = createZeroMatrix(codeLength, codeLength); // Временный результат умножения
-	//uint8_t** L_new = createZeroMatrix(wordsCount, codeLength); // Временная копия матрицы кодовых слов
-	uint8_t* base = new uint8_t[codeLength];
-
-	//printMatrix("L ", L, wordsCount, codeLength);
-	//printMatrix("G_tmp", G_tmp, codeLength, codeLength);
-
-	// Выделение памяти на ГПУ
-	uint8_t* d_L = nullptr;
-	uint8_t* d_base = nullptr;
-
-	size_t L_bytes = wordsCount * codeLength * sizeof(uint8_t);
+	size_t L_bytes = L_words * sizeof(uint64_t);
+	size_t G_bytes = G_words * sizeof(uint64_t);
+	size_t base_bytes = wpr * sizeof(uint64_t);
+	uint64_t* G_tmp = createIdentityPacked(codeLength);
 
 	CUDA_CHECK(cudaMalloc(&d_L, L_bytes));
-	CUDA_CHECK(cudaMalloc(&d_base, codeLength * sizeof(uint8_t)));
-	// Копируем L на устройство 1 раз
+	CUDA_CHECK(cudaMalloc(&d_G_tmp, G_bytes));
 	CUDA_CHECK(cudaMemcpy(d_L, h_L, L_bytes, cudaMemcpyHostToDevice));
+	CUDA_CHECK(cudaMalloc(&d_base, wpr * sizeof(uint64_t)));
+	CUDA_CHECK(cudaMalloc(&d_pivot, sizeof(int)));
+	CUDA_CHECK(cudaMemcpy(d_G_tmp, G_tmp, G_bytes, cudaMemcpyHostToDevice));
 
+	mainFunction(
+		wordsCount,
+		codeLength,
+		infoLength,
+		d_L,
+		d_G_tmp,
+		d_pivot,
+		d_base,
+		wpr
+	);
 
-	int threads = 256;
-	int blocks = (wordsCount + threads - 1) / threads;
+	CUDA_CHECK(cudaMemcpy(G_tmp, d_G_tmp, G_bytes, cudaMemcpyDeviceToHost));
+	WriteResultPackedToBin(OutputFileName, G_tmp, codeLength, wpr);
 
-	// ===================== Основной цикл (k шагов) =====================
-	for (int col = 0; col < infoLength; col++) {
-
-		cout << "Шаг col = " << col << endl;
-
-		// 1. Ищем строку, у которой в столбце col стоит 1
-		int pivot_row = -1;
-		for (int row = 0; row < wordsCount; row++) {
-			if (h_L[row*codeLength +col] == 1) {
-				pivot_row = (int)row;
-				break;
-			}
-		}
-
-		if (pivot_row == -1) {
-			cout << "Базис не найден в столбце " << col << endl;
-			continue;
-		}
-
-		// 2. Запоминаем базисный вектор
-		memcpy(base, h_L + pivot_row * codeLength, codeLength);
-
-		// 3. Строим текущую матрицу G (cpu)
-		for (size_t i = 0; i < codeLength; i++) {
-			memset(G[i], 0, codeLength);
-			G[i][i] = 1;
-		}
-		for (int j = col; j < codeLength; j++) {
-			G[col][j] = base[j];
-		}
-
-		// 4. ИСКЛЮЧЕНИЕ СТОЛБЦОВ НА ГПУ
-		// Отправляем базис на гпу
-		CUDA_CHECK(cudaMemcpy(d_base, base, codeLength, cudaMemcpyHostToDevice));
-
-		eliminateColumnKernel << <blocks, threads >> > (d_L, d_base, col, (int)wordsCount, (int)codeLength);
-
-		CUDA_CHECK(cudaGetLastError());
-		CUDA_CHECK(cudaDeviceSynchronize());
-
-		// Забираем обновленную Л обратно на хост (нужно тк поиск пивотов идет на цпу)
-		CUDA_CHECK(cudaMemcpy(h_L, d_L, L_bytes, cudaMemcpyDeviceToHost));
-
-		//Умножение на ГПУ
-		matrixToFlat(G_tmp, h_G_tmp, codeLength);
-		matrixToFlat(G, h_G, codeLength);
-
-		CUDA_CHECK(cudaMemcpy(d_G_tmp, h_G_tmp, G_bytes, cudaMemcpyHostToDevice));
-		CUDA_CHECK(cudaMemcpy(d_G, h_G, G_bytes, cudaMemcpyHostToDevice));
-
-		dim3 block(16, 16);
-		dim3 grid(
-			(codeLength + block.x - 1) / block.x,
-			(codeLength + block.y - 1) / block.y
-		);
-
-		matMulKernel << < grid, block >> > (d_G_tmp, d_G, d_G_res, (int)codeLength);
-		CUDA_CHECK(cudaGetLastError());
-		CUDA_CHECK(cudaDeviceSynchronize());
-
-		CUDA_CHECK(cudaMemcpy(h_G_res, d_G_res, G_bytes, cudaMemcpyDeviceToHost));
-
-		flatToMatrix(h_G_res, G_tmp, codeLength);
-
-	
-		//for (size_t i = 0; i < codeLength; i++) {
-		//	for (int j = 0; j < codeLength; j++) {
-		//		uint8_t sum = 0;
-		//		for (size_t k = 0; k < codeLength; k++) {
-		//			sum ^= (G_tmp[i][k] & G[k][j]);   // умножение + XOR
-		//		}
-		//		G_res[i][j] = sum;
-		//	}
-		//}
-
-		//// обновляем G_tmp
-		//copyMatrix(G_tmp, G_res, codeLength, codeLength);
-		////printMatrix("G_tmp после умножения (накопление)", G_tmp, codeLength, codeLength);
-	}
-
-	if (isBis) {
-		WriteResultToFile(OutputFileName, G_tmp, codeLength, true);
-	}
-	else {
-		WriteResultToFile(OutputFileName, G_tmp, codeLength, false);
-	}
-	
-
-	cout << "=== ИТОГОВАЯ МАТРИЦА ПРЕОБРАЗОВАНИЯ G_res ===" << endl;
-	printMatrix("G_res", G_tmp, codeLength, codeLength);
-
-
+	// Освобождение
 	CUDA_CHECK(cudaFree(d_L));
-	CUDA_CHECK(cudaFree(d_base));
 	CUDA_CHECK(cudaFree(d_G_tmp));
-	CUDA_CHECK(cudaFree(d_G));
-	CUDA_CHECK(cudaFree(d_G_res));
-
-	freeMatrix(G_tmp, codeLength);
-	freeMatrix(G, codeLength);
-	freeMatrix(G_res, codeLength);
+	CUDA_CHECK(cudaFree(d_pivot));
+	CUDA_CHECK(cudaFree(d_base));
 
 	delete[] h_L;
-	delete[] base;
-	delete[] h_G_tmp;
-	delete[] h_G;
-	delete[] h_G_res;
-		
-	cout << "Закончили" << endl;
+	delete[] G_tmp;
+
+	auto ms = chrono::duration_cast<chrono::milliseconds>(chrono::high_resolution_clock::now() - start).count();
+	cout << ms << endl;
+
 	return 0;
 }
