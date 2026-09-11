@@ -6,7 +6,6 @@
 #include <fstream>
 #include <cstring>
 #include <cstdint>
-#include <algorithm>
 #include <locale.h>
 #include <chrono>
 
@@ -14,7 +13,7 @@ using namespace std;
 
 constexpr int THREADS_PER_BLOCK = 256;
 
-size_t codeLength = 1920;  // n
+size_t codeLength = 1900;  // n
 size_t infoLength = 1280;  // k
 
 constexpr int BITS = 64;
@@ -83,20 +82,6 @@ __device__ void xorTailFast(
 	// полные слова до конца
 	for (int w = startWord; w < nWords; w++) {
 		row[w] ^= base[w];
-	}
-}
-
-__device__ void xorTailSimple(
-	uint64_t* row,
-	const uint64_t* base,
-	int col,
-	int n)
-{
-	for (int j = col + 1; j < n; j++) {
-		if (getBit(base, j)) {
-			// toggle bit j in row
-			row[j / BITS] ^= (1ULL << (j % BITS));
-		}
 	}
 }
 
@@ -254,7 +239,7 @@ int main() {
 
 	auto start = chrono::high_resolution_clock::now();
 
-	string InputFileName = R"(D:\Rubin\sessions\tmp_1783328386069\files\7.16.bin)";
+	string InputFileName = R"(D:\Rubin\sessions\tmp_1783328386069\files\4.4.bin)";
 	string OutputFileName = R"(D:\Rubin\sessions\tmp_1783328386069\files\output.bin)";
 	bool isBis = false;
 
@@ -271,11 +256,9 @@ int main() {
 
 	size_t wpr = wordsPerRow(codeLength);
 	size_t L_words = wordsCount * wpr;
-	size_t G_words = codeLength * wpr;
 
 	size_t L_bytes = L_words * sizeof(uint64_t);
-	size_t G_bytes = G_words * sizeof(uint64_t);
-	size_t base_bytes = wpr * sizeof(uint64_t);
+	size_t G_bytes = codeLength * wpr * sizeof(uint64_t);
 	uint64_t* G_tmp = createIdentityPacked(codeLength);
 
 	CUDA_CHECK(cudaMalloc(&d_L, L_bytes));
