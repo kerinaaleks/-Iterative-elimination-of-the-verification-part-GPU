@@ -195,8 +195,7 @@ bool ReadCodeWords(
 		}
 	}
 	else {
-		// BIN: как эталон — LSB first (mask 1,2,4,...,128)
-		// поток бит непрерывный: слово0, слово1, ...
+		// BIN
 		size_t bitPos = 0;
 		for (size_t w = 0; w < wordsCount; w++) {
 			uint8_t* row = L + w * bpr;
@@ -261,45 +260,77 @@ void WriteResultPacked(
 		delete[] buf;
 	}
 }
-
+// Основной циклитерационного исключения
 void runIterativeEliminationGPU(
-	size_t wordsCount,
-	size_t codeLength,
-	size_t infoLength,
-	uint8_t* d_L,
-	uint8_t* d_G_tmp,
-	int* d_pivot,
-	uint8_t* d_base,
-	int bpr)
+	size_t wordsCount, // число кодовых слов
+	size_t codeLength, // длина слова
+	size_t infoLength, // число шагов
+	uint8_t* d_L, // матрица кодовых слов на ГПУ
+	uint8_t* d_G_tmp, // накопленная Г на ГПУ
+	int* d_pivot, // номер пивота строки на ГПУ
+	uint8_t* d_base, // копия опорной строки на ГПУ
+	int bpr) // bytes per row = ceil(n/8)
 {
-	int blocks = (int)((wordsCount + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+	int blocks = (int)((wordsCount + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK); // сколько блоков необходимо, что бы покрыть все строки Л
 	int gBlocks = (int)((codeLength + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
 
+	//создание streams
+	cudaStream_t streamPivot, streamUpdate, streamElim;
+	CUDA_CHECK(cudaStreamCreate(&streamPivot)); // сброс пивота, поискб копия 
+	CUDA_CHECK(cudaStreamCreate(&streamUpdate)); // ядро updateGTmpKernel
+	CUDA_CHECK(cudaStreamCreate(&streamElim)); // ядро eleminateColumnKernel
+
+	int* h_pivot_pinned = nullptr;
+	// pinned память pivot
+	CUDA_CHECK(cudaMallocHost(&h_pivot_pinned, sizeof(int)));
+
+	// Цикл по столбцам
 	for (int col = 0; col < (int)infoLength; col++) {
-		int h_pivot = (int)wordsCount;
-		CUDA_CHECK(cudaMemcpy(d_pivot, &h_pivot, sizeof(int), cudaMemcpyHostToDevice));
+		*h_pivot_pinned = (int)wordsCount; // если единиц в столбце нет, значение так и останется wordsCount, значит пропускаем столбец
 
-		findPivotKernel << <blocks, THREADS_PER_BLOCK >> > (
-			d_L, col, (int)wordsCount, bpr, d_pivot);
-		CUDA_CHECK(cudaDeviceSynchronize());
+		CUDA_CHECK(cudaMemcpyAsync(
+			d_pivot, h_pivot_pinned, sizeof(int),
+			cudaMemcpyHostToDevice, streamPivot));
+		// Поиск пивотов
+		findPivotKernel << <blocks, THREADS_PER_BLOCK, 0, streamPivot >> > ( // каждый поток смотрит свою строку
+			d_L, col, (int)wordsCount, bpr, d_pivot);//как итог d_pivot - минномер строки с единицей
 
-		CUDA_CHECK(cudaMemcpy(&h_pivot, d_pivot, sizeof(int), cudaMemcpyDeviceToHost));
-		if (h_pivot >= (int)wordsCount) continue;
+		// Переносим pivot на ЦПУ
+		CUDA_CHECK(cudaMemcpyAsync(
+			h_pivot_pinned, d_pivot, sizeof(int),
+			cudaMemcpyDeviceToHost, streamPivot));
 
-		CUDA_CHECK(cudaMemcpy(
+		CUDA_CHECK(cudaStreamSynchronize(streamPivot)); // пока Цпу не узнает pivot нельзя понять откуда копировать base
+
+		int h_pivot = *h_pivot_pinned;
+		if (h_pivot >= (int)wordsCount) // если нет опорной строки
+			continue; // пропускаем шаг
+
+		// Копируем base
+		CUDA_CHECK(cudaMemcpyAsync(
 			d_base,
-			d_L + (size_t)h_pivot * bpr,
+			d_L + (size_t)h_pivot * bpr, // начало пивот строки в плоском Л
 			(size_t)bpr * sizeof(uint8_t),
-			cudaMemcpyDeviceToDevice));
+			cudaMemcpyDeviceToDevice,
+			streamPivot));
+		CUDA_CHECK(cudaStreamSynchronize(streamPivot)); // base готов
 
-		updateGTmpKernel << <gBlocks, THREADS_PER_BLOCK >> > (
+		// Два независимых ядра — параллельно
+		updateGTmpKernel << <gBlocks, THREADS_PER_BLOCK, 0, streamUpdate >> > (
 			d_G_tmp, d_base, col, (int)codeLength, bpr);
 
-		eliminateColumnKernel << <blocks, THREADS_PER_BLOCK >> > (
+		eliminateColumnKernel << <blocks, THREADS_PER_BLOCK, 0, streamElim >> > (
 			d_L, d_base, col, (int)wordsCount, (int)codeLength, bpr);
 
-		CUDA_CHECK(cudaDeviceSynchronize());
+		CUDA_CHECK(cudaStreamSynchronize(streamUpdate));
+		CUDA_CHECK(cudaStreamSynchronize(streamElim));
+		// оба закончились, значит можно следующий col
 	}
+	// Освобождение память
+	CUDA_CHECK(cudaFreeHost(h_pivot_pinned));
+	CUDA_CHECK(cudaStreamDestroy(streamPivot));
+	CUDA_CHECK(cudaStreamDestroy(streamUpdate));
+	CUDA_CHECK(cudaStreamDestroy(streamElim));
 }
 
 int main() {
@@ -312,7 +343,17 @@ int main() {
 
 	size_t codeLength = 16200;  // n
 	size_t infoLength = 3960;  // k
-	double mCoeff = 1.5;
+	double mCoeff = 2000.5;
+
+	// Разделение процессов на карты
+	int deviceCount = 0;
+	CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
+	if (deviceCount <= 0) {
+		cerr << "CUDA GPU не найдены" << endl;
+		return 1;
+	}
+
+	CUDA_CHECK(cudaSetDevice(0));
 
 	uint8_t* h_L = nullptr;
 	uint8_t* d_L = nullptr;
@@ -329,12 +370,6 @@ int main() {
 	auto ms1 = chrono::duration_cast<chrono::milliseconds>(chrono::high_resolution_clock::now() - start1).count();
 	cout << ms1 << endl;
 	cout << "Закончили чтение " << endl;
-
-	cout << "first bits: ";
-	for (int i = 0; i < 64; i++)
-		cout << getBit(h_L, i) << " ";
-	cout << endl;
-
 
 	size_t bpr = bytesPerRow(codeLength);
 	size_t L_bytes = wordsCount * bpr * sizeof(uint8_t);
@@ -363,8 +398,7 @@ int main() {
 	delete[] h_L;
 	delete[] G_tmp;
 
-	cout << chrono::duration_cast<chrono::milliseconds>(
-		chrono::high_resolution_clock::now() - start).count() << endl;
+	cout << chrono::duration_cast<chrono::milliseconds>(chrono::high_resolution_clock::now() - start).count() << endl;
 
 	return 0;
 }
