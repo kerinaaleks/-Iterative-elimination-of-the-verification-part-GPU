@@ -156,6 +156,7 @@ bool ReadCodeWords(
 	file.seekg(0, ios::beg);
 
 	size_t fileBits = isBis ? fileSizeBytes : fileSizeBytes * 8;
+
 	size_t wantBits = (size_t)(mCoeff * (double)codeLength * (double)codeLength);
 	wantBits = (wantBits / codeLength) * codeLength;
 
@@ -174,27 +175,15 @@ bool ReadCodeWords(
 		bytesToRead = fileSizeBytes;
 
 	uint8_t* buffer = new uint8_t[bytesToRead];
-	file.read(reinterpret_cast<char*>(buffer), bytesToRead);
+	file.read(reinterpret_cast<char*>(buffer), (std::streamsize)bytesToRead);
 	file.close();
 
 	const size_t bpr = bytesPerRow(codeLength);
 	L = new uint8_t[wordsCount * bpr];
+	memset(L, 0, wordsCount * bpr);
 
-	if (!isBis && (codeLength % 8 == 0)) {
-		// BIN + n кратно 8: в файле уже тот же layout, что у packed L
-		// одно кодовое слово = ровно bpr байт
-		const size_t need = wordsCount * bpr;
-		if (need > bytesToRead) {
-			cout << "Недостаточно байт в файле для memcpy" << endl;
-			delete[] buffer;
-			delete[] L;
-			L = nullptr;
-			return false;
-		}
-		memcpy(L, buffer, need);
-	}
-	else if (isBis) {
-		memset(L, 0, wordsCount * bpr);
+	if (isBis) {
+		// 1 байт файла = 1 бит
 		size_t pos = 0;
 		for (size_t w = 0; w < wordsCount; w++) {
 			uint8_t* row = L + w * bpr;
@@ -206,27 +195,29 @@ bool ReadCodeWords(
 		}
 	}
 	else {
-		// BIN, n не кратно 8 — побитовая сборка
-		memset(L, 0, wordsCount * bpr);
+		// BIN: как эталон — LSB first (mask 1,2,4,...,128)
+		// поток бит непрерывный: слово0, слово1, ...
 		size_t bitPos = 0;
 		for (size_t w = 0; w < wordsCount; w++) {
 			uint8_t* row = L + w * bpr;
 			for (size_t b = 0; b < codeLength; b++) {
 				size_t byteIndex = bitPos / 8;
-				size_t bitIndex = bitPos % 8;
+				size_t bitIndex = bitPos % 8; // 0 = младший бит байта
 				if (byteIndex < bytesToRead) {
-					int bit = (buffer[byteIndex] >> bitIndex) & 1;
-					if (bit) setBit(row, (int)b, 1);
+					// эквивалент: buffer[byteIndex] & (1 << bitIndex)
+					if ((buffer[byteIndex] >> bitIndex) & 1)
+						setBit(row, (int)b, 1);
 				}
 				bitPos++;
 			}
 		}
+		// memcpy при n%8==0 даёт то же только если тот же LSB-порядок;
+		// для отладки лучше всегда этот путь (потом можно вернуть memcpy)
 	}
 
 	delete[] buffer;
 	return true;
 }
-
 
 void WriteResultPacked(
 	const string& path,
@@ -315,13 +306,13 @@ int main() {
 	setlocale(LC_ALL, "");
 	auto start = chrono::high_resolution_clock::now();
 
-	string InputFileName = R"(D:\Rubin\sessions\tmp_1783328386069\files\8800.bin)";
+	string InputFileName = R"(D:\Rubin\sessions\tmp_1783328386069\files\11.11.bin)";
 	string OutputFileName = R"(D:\Rubin\sessions\tmp_1783328386069\files\output.bin)";
 	bool isBis = false;
 
-	size_t codeLength = 2004;  // n
-	size_t infoLength = 1280;  // k
-	double mCoeff = 28.0;
+	size_t codeLength = 16200;  // n
+	size_t infoLength = 3960;  // k
+	double mCoeff = 1.5;
 
 	uint8_t* h_L = nullptr;
 	uint8_t* d_L = nullptr;
@@ -338,6 +329,11 @@ int main() {
 	auto ms1 = chrono::duration_cast<chrono::milliseconds>(chrono::high_resolution_clock::now() - start1).count();
 	cout << ms1 << endl;
 	cout << "Закончили чтение " << endl;
+
+	cout << "first bits: ";
+	for (int i = 0; i < 64; i++)
+		cout << getBit(h_L, i) << " ";
+	cout << endl;
 
 
 	size_t bpr = bytesPerRow(codeLength);
