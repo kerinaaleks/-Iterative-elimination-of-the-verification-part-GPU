@@ -36,7 +36,7 @@ __host__ __device__ inline void setBit(uint8_t* row, int bit, int val) {
         } \
     } while (0)
 
-// ====================== Kernels ======================
+// Kernel-ы
 
 __global__ void findPivotKernel(
 	const uint8_t* L,
@@ -126,7 +126,7 @@ __global__ void eliminateColumnKernel(
 	xorTailFast(rowPtr, base, col, n);
 }
 
-// ====================== Host helpers ======================
+// Вспомогательные функции хоста
 
 uint8_t* createIdentityPacked(size_t n) {
 	size_t bpr = bytesPerRow(n);
@@ -344,16 +344,6 @@ int main() {
 	size_t codeLength = 16200;  // n
 	size_t infoLength = 3960;  // k
 	double mCoeff = 2000.5;
-
-	// Разделение процессов на карты
-	int deviceCount = 0;
-	CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
-	if (deviceCount <= 0) {
-		cerr << "CUDA GPU не найдены" << endl;
-		return 1;
-	}
-
-	CUDA_CHECK(cudaSetDevice(0));
 
 	uint8_t* h_L = nullptr;
 	uint8_t* d_L = nullptr;
